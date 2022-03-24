@@ -163,15 +163,14 @@ class KSQS: # quantum system kalman smoother, state is vectorized density matrix
      3. **additional recources**Algorithm 4.1 (page 88) in S. Särkkä, “Bayesian Estimation of Time-Varying Systems: Discrete-Time Systems.” 
 
      
-     x_t = F x_t-1 + w_t, w_t \sim N(0, Q, P)
-     y_t = h(x_t) + v_t, v_t \sim N(0, R, U) # U should be a zero matrix since measurement noise is real
+     x_t = F x_t-1 + w_t, w_t \sim CN(0, Q, P)
+     y_t = h(x_t) + v_t, v_t \sim N(0, R) 
      
      x is the state to be estimated, dimension p*1, scipy sparse.csc_matrix array
      M is covariance matrix, M = E[(x-E[x])(x-E[x])^H], dimension p*p, scipy sparse.csc_matrix array
      Q is covariance of observation noise, dimension p*p, scipy sparse.csc_matrix array
-     R is covariance of measurement noise, dimension p*p, scipy sparse.csc_matrix array
+     R is covariance of measurement noise, dimension q*q, scipy sparse.csc_matrix array
      P is pseudocovariance of observation noise, dimension p*p, scipy sparse.csc_matrix array
-     U is pseudocovariance of measurement noise, dimension p*p, scipy sparse.csc_matrix array
     """
     def __init__(self, ys, F, x, M, Q, R, P=None, Augmented = False):
         self.k = 0 # number of iterations, start with 0      
@@ -212,7 +211,11 @@ class KSQS: # quantum system kalman smoother, state is vectorized density matrix
                               hstack([self.P.conjugate(), self.Q.conjugate()], format='csc')],
                              format='csc')
             # Noise of measurement
-            self.Ra = csc_matrix(R)
+            self.R = csc_matrix(R)
+            self.U = self.R.copy()
+            self.Ra = vstack([hstack([self.R, self.U], format='csc'),
+                              hstack([self.U.conjugate(), self.R.conjugate()], format='csc')],
+                             format='csc')
             # State transition function
             self.F = csc_matrix(F,dtype=complex)
             self.Fa = block_diag((self.F, self.F.conjugate()), format='csc')
@@ -230,10 +233,7 @@ class KSQS: # quantum system kalman smoother, state is vectorized density matrix
         self.Ma_smooth_seq = []
         
         self.H = self.meas_mat(self.num_qubits)
-        nrows = 2**self.num_qubits
-        ncols = nrows**2
-        mat = csc_matrix((nrows, ncols), dtype=complex)
-        self.Ha = 0.5*hstack([self.H, self.H], format='csc')
+        self.Ha = block_diag((self.H, self.H.conjugate()), format='csc')
         
     def meas_mat(self, num_qubits):# H, measurement matrix for vectorized density matrix
         nrows = 2**num_qubits
@@ -266,8 +266,7 @@ class KSQS: # quantum system kalman smoother, state is vectorized density matrix
      
         
     def meas_update(self,y):
-        # ya = vstack([y, y.conjugate()], format='csc')
-        ya = csc_matrix(y)
+        ya = vstack([y, y.conjugate()], format='csc')
         Ha_Hem = self.Ha.getH().tocsc()
         # Kalman Gain, # G = MH^H(HMH^H + R)^-1 => (HMH^H + R)^T G^T = (MH)^T
         # So do not need to take inverse, faster!
@@ -338,7 +337,7 @@ class KSQS: # quantum system kalman smoother, state is vectorized density matrix
                 Mk_prio_smooth = self.Ma_seq[t_inv-1].dot(Gkm2_Hem) +\
                                 Gkm1.dot(self.Ma_prio_smooth_seq[0] - self.Fa.dot(self.Ma_seq[t_inv-1])).dot(Gkm2_Hem)
                 self.Ma_prio_smooth_seq.insert(0,Mk_prio_smooth)
-        return self.xa_smooth_seq, self.Ma_smooth_seq, self.Ma_prio_smooth_seq
+        return self.Fa, self.xa_smooth_seq, self.Ma_smooth_seq, self.Ma_prio_smooth_seq
     
     
     
@@ -348,16 +347,15 @@ class EMLearn:
     EM algorithm for augmented complex first-order Kalman filter with RTS smoother.
     Refers to R. H. Shumway and D. S. Stoffer, “AN APPROACH TO TIME SERIES SMOOTHING AND FORECASTING USING THE EM ALGORITHM,” doi: 10.1111/j.1467-9892.1982.tb00349.x
     
-     x_t = F x_t-1 + w_t, w_t \sim N(0, Q, P)
-     y_t = h(x_t) + v_t, v_t \sim N(0, R, U) --> linearized to y_t = H_t x_t + v_t,
+     x_t = F x_t-1 + w_t, w_t \sim CN(0, Q, P)
+     y_t = h(x_t) + v_t, v_t \sim N(0, R) --> linearized to y_t = H_t x_t + v_t,
      where H_t is the Jacobian matrix of h evaluated at x_{t|t-1} (i.e., prior estimate of x_t)
      
      xhat0 is E[x0], dimension p*1, scipy sparse.csr_matrix array
      M0 is covariance matrix, M = E[(x0-E[x0])(x0-E[x0])^H], dimension p*p, scipy sparse.csr_matrix array
      Q is covariance of observation noise, dimension p*p, scipy sparse.csr_matrix array
-     R is covariance of measurement noise, dimension p*p, scipy sparse.csr_matrix array
+     R is covariance of measurement noise, dimension q*q scipy sparse.csr_matrix array
      P is pseudocovariance of observation noise, dimension p*p, scipy sparse.csr_matrix array
-     U is pseudocovariance of measurement noise (should be a zero matrix), dimension p*p, scipy sparse.csr_matrix array
     
     The purpose is to maximize the log-likelihood, i.e.,
                         max log(p(y0:T|M0, Q, R, P, U))
@@ -387,15 +385,15 @@ class EMLearn:
         self.ys = ys
         self.yas = [] # augmented measurements for time step in 1, 2, ... T (NOT INCLUDE TIME 0)
         for y in ys:
-            ya = csc_matrix(y.reshape((self.q,1)))
+            ya = csc_matrix(np.hstack([y,y.conjugate()]).reshape((2*self.q,1)))
             self.yas.append(ya)
-        self.x0 = smoother.xa.copy() # augmented initial expected state
+        self.x0 = smoother.xa_initial.copy() # augmented initial expected state
         self.x0_smoothed = None
-        self.M0 = smoother.Ma.copy() # augmented covariance matrix of errors of initial state
+        self.M0 = smoother.Ma_initial.copy() # augmented covariance matrix of errors of initial state
         self.M0_smoothed = None
         self.Qa = smoother.Qa.copy() # augmented covariance matrix for state noise
         self.Ra = smoother.Ra.copy() # augmented covarance matrix for measurement noise
-        self.Fa = smoother.Fa.copy() # state transition matrix, TODO: make it indexed by time
+        self.Fa = smoother.Fa.copy() # state transition matrix
         self.Ha = smoother.Ha.copy()
         
         
@@ -412,57 +410,48 @@ class EMLearn:
         logdet = np.log(diagL).sum() + np.log(diagU).sum()
         return logdet
         
-    def log_likelihood(self): # see Equation (8)
-        Fhem = self.Fa.getH().tocsc()
-        # for mean and covariance of x0
-        diff_x = self.x0_smoothed - self.x0
-        x_cov = diff_x.dot(diff_x.getH().tocsc())
-        mat_temp0 = self.M0_smoothed + x_cov
-        mat_temp1 = spsolve(self.M0, mat_temp0)
+    def log_likelihood(self):
+        # Fhem = self.Fa.getH().tocsc()
+        # # for mean and covariance of x0
+        # diff_x = self.x0_smoothed - self.x0 # what is mu and x0
+        # x_cov = diff_x.dot(diff_x.getH().tocsc())
+        # mat_temp0 = self.M0_smoothed + x_cov
+        # mat_temp1 = spsolve(self.M0, mat_temp0)
         
-        # intermediate terms for state x and observation y
-        mat_A = csc_matrix((2*self.p, 2*self.p))
-        mat_B = csc_matrix((2*self.p, 2*self.p))
-        mat_C = csc_matrix((2*self.p, 2*self.p))
-        for t in range(1, self.T+1): # real time step, not python index
-            xtm1_smoothed = self.xa_seq[t-1]
-            xt_smoothed = self.xa_seq[t]
-            mat_A += self.Ma_seq[t-1] + xtm1_smoothed.dot(xtm1_smoothed.getH().tocsc()) # Equation (9)
-            mat_B += self.Ma_prio_seq[t-1] + xt_smoothed.dot(xtm1_smoothed.getH().tocsc()) # Equation (10)
-            mat_C += self.Ma_seq[t] + xt_smoothed.dot(xt_smoothed.getH().tocsc()) # Equation (11)
+        # # state x
+        # BFhem = self.mat_B.dot(Fhem)
+        # FAFhem = self.Fa.dot(self.mat_A).dot(Fhem)
+        # mat_temp2 = spsolve(self.Qa, self.mat_C - BFhem - BFhem.getH().tocsc() + FAFhem)
         
-        # state x
-        BFhem = mat_B.dot(Fhem)
-        FAFhem = self.Fa.dot(mat_A).dot(Fhem)
-        mat_temp2 = spsolve(self.Qa, mat_C - BFhem - BFhem.getH().tocsc() + FAFhem)
+        # # observation y
+        # mat_temp3 = csc_matrix((2*self.q, 2*self.q))
+        # for t in range(1, self.T+1): # real time step, not python index
+        #     ymHx = self.yas[t-1] - sparse_col_vec_dot(self.Ha, self.xa_seq[t])
+        #     mat_temp3 += ymHx.dot(ymHx.getH().tocsc()) +\
+        #                 self.Ha.dot(self.Ma_seq[t]).dot(self.Ha.getH().tocsc())
+        # mat_temp4 = spsolve(self.Ra, mat_temp3)
         
-        # observation y
-        mat_temp3 = csc_matrix((self.q, self.q))
-        for t in range(1, self.T+1): # real time step, not python index
-            ymHx = self.yas[t-1] - self.Ha.dot(self.xa_seq[t])
-            mat_temp3 += ymHx.dot(ymHx.getH().tocsc()) +\
-                        self.Ha.dot(self.Ma_seq[t]).dot(self.Ha.getH().tocsc())
-        mat_temp4 = spsolve(self.Ra, mat_temp3)
-        
-        ll = -0.5*self.mat_det(self.M0).real - 0.5*spsolve(self.M0, mat_temp0).diagonal().sum().real -\
-              0.5*self.T*self.mat_det(self.Qa).real - 0.5*mat_temp2.diagonal().sum().real - \
-              0.5*self.T*self.mat_det(self.Ra).real -0.5*mat_temp4.diagonal().sum().real # Equation (8)
+        # ll = -0.5*self.mat_det(self.M0).real - 0.5*spsolve(self.M0, mat_temp0).diagonal().sum().real -\
+        #       0.5*self.T*self.mat_det(self.Qa).real - 0.5*mat_temp2.diagonal().sum().real - \
+        #       0.5*self.T*self.mat_det(self.Ra).real -0.5*mat_temp4.diagonal().sum().real # Equation (8)
               
-        # ll = 0 # Equation (18)
-        # for t in range(1, self.T+1):
-        #     try:
-        #         HPHR = self.Ha.dot(self.Ma_ns_prio_seq[t-1]).dot(self.Ha.getH().tocsc()) + self.Ra
-        #         HPHR_inv = spsolve(HPHR, identity(2*self.q, dtype=complex, format='csc') )
-        #     except:
-        #         print("Error")
-        #         print(t)
-        #         print(self.Ha)
-        #         print(self.Ma_ns_prio_seq[t-1])
-        #     ymHx = self.yas[t-1] - sparse_col_vec_dot(self.Ha, self.xa_ns_prio_seq[t-1])
-        #     # ll += -0.5 * np.log(self.mat_det(HPHR)) - 0.5*spsolve(HPHR, ymHx.dot(ymHx.getH().tocsc())).diagonal().sum()
-        #     ll += -0.5 * self.mat_det(HPHR).real - 0.5*(ymHx.getH().dot(HPHR_inv).dot(ymHx)).data.real[0]
+        ll = 0 # Equation (18)
+        for t in range(1, self.T+1):
+            HPHpR = self.Ha.dot(self.Ma_ns_prio_seq[t-1]).dot(self.Ha.getH().tocsc()) + self.Ra
+            HPHpR_inv = spsolve(HPHpR, identity(2*self.q, dtype=complex, format='csc') )
+            # try:
+            #     HPHR = self.Ha.dot(self.Ma_ns_prio_seq[t-1]).dot(self.Ha.getH().tocsc()) + self.Ra
+            #     HPHR_inv = spsolve(HPHR, identity(2*self.q, dtype=complex, format='csc') )
+            # except:
+            #     print("Error")
+            #     print(t)
+            #     print(self.Ha)
+            #     print(self.Ma_ns_prio_seq[t-1])
+            ymHx = self.yas[t-1] - self.Ha.dot(self.xa_ns_prio_seq[t-1])
+            # ll += -0.5 * np.log(self.mat_det(HPHR)) - 0.5*spsolve(HPHR, ymHx.dot(ymHx.getH().tocsc())).diagonal().sum()
+            ll += -0.5 * self.mat_det(HPHpR).real - 0.5*(ymHx.getH().dot(HPHpR_inv).dot(ymHx)).data.real[0]
         
-        return ll, mat_A, mat_B, mat_C, mat_temp0, mat_temp3
+        return ll
         
 
     def learn(self, eps=1e-3):
@@ -473,71 +462,88 @@ class EMLearn:
                           self.Qa, 
                           self.Ra, 
                           Augmented = True)
-        self.xa_seq, self.Ma_seq, self.Ma_prio_seq = smoother.smooth() # NOTE: self.xa_seq, self.Ma_seq contains elements at time 0, while the last two does not
+        self.Fa, self.xa_seq, self.Ma_seq, self.Ma_prio_seq = smoother.smooth() # NOTE: self.xa_seq, self.Ma_seq contains elements at time 0, while the last two does not
         self.x0_smoothed = self.xa_seq[0].copy()
         self.M0_smoothed = self.Ma_seq[0].copy()
         self.xa_ns_prio_seq = smoother.xa_prio_seq[1:]
         self.Ma_ns_prio_seq = smoother.Ma_prio_seq[1:]
         
-        this_ll, mat_A, mat_B, mat_C, mat_int1, mat_int2= self.log_likelihood()
-        # update parameters
-        BAinv = spsolve(mat_A.transpose(), mat_B.transpose()).transpose()
-        self.x0 = self.xa_seq[0].copy() # update E[x0]
-        self.M0 = self.Ma_seq[0].copy()
-        Fhem = self.Fa.getH().tocsc()
-        BFhem = mat_B.dot(Fhem)
-        FAFhem = self.Fa.dot(mat_A).dot(Fhem)
-        self.Qa = 1/self.T * (mat_C - BFhem - BFhem.getH().tocsc() + FAFhem)
-        self.Ra = 1/self.T * (mat_int2)
+        # intermediate terms for state x and observation y
+        self.mat_A = csc_matrix((2*self.p, 2*self.p))
+        self.mat_B = csc_matrix((2*self.p, 2*self.p))
+        self.mat_C = csc_matrix((2*self.p, 2*self.p))
+        for t in range(1, self.T+1): # real time step, not python index
+            xtm1_smoothed = self.xa_seq[t-1]
+            xt_smoothed = self.xa_seq[t]
+            self.mat_A += self.Ma_seq[t-1] + xtm1_smoothed.dot(xtm1_smoothed.getH().tocsc()) # Equation (9)
+            self.mat_B += self.Ma_prio_seq[t-1] + xt_smoothed.dot(xtm1_smoothed.getH().tocsc()) # Equation (10)
+            self.mat_C += self.Ma_seq[t] + xt_smoothed.dot(xt_smoothed.getH().tocsc()) # Equation (11)
         
-        last_sol = (self.x0.copy(), self.M0.copy(), self.Qa.copy(), self.Ra.copy(), self.Fa.copy())
+        # update F, Q, and R
+        BAinv = spsolve(self.mat_A.getH().tocsc(), self.mat_B.getH().tocsc()).getH().tocsc()
+        self.Fa = BAinv.copy() # update F
+        self.Qa = 1/self.T * (self.mat_C - BAinv.dot(self.mat_B.getH().tocsc())) # update Q
+        self.Ra = csc_matrix((2*self.q, 2*self.q))
+        for t in range(1, self.T+1): # real time step, not python index
+            ymHx = self.yas[t-1] - sparse_col_vec_dot(self.Ha, self.xa_seq[t])
+            self.Ra += 1/self.T * ymHx.dot(ymHx.getH().tocsc()) +\
+                        self.Ha.dot(self.Ma_seq[t]).dot(self.Ha.getH().tocsc())
         
         
         
-        last_ll = this_ll - 10
+        this_ll = self.log_likelihood()
+        last_ll = this_ll - 0.1 - 10*eps
         
         counter = 0
-        while True:
-            counter += 1            
-            # compute new likelihood
-            smoother = KSQS(self.ys, 
-                              self.Fa, 
-                              self.x0, self.M0, 
-                              self.Qa, 
-                              self.Ra, 
-                              Augmented = True)
-            self.xa_seq, self.Ma_seq, self.Ma_prio_seq = smoother.smooth() # NOTE: self.xa_seq, self.Ma_seq contains elements at time 0, while the last two does not
-            self.x0_smoothed = self.xa_seq[0].copy()
-            self.M0_smoothed = self.Ma_seq[0].copy()
-            self.xa_ns_prio_seq = smoother.xa_prio_seq[1:]
-            self.Ma_ns_prio_seq = smoother.Ma_prio_seq[1:]
-            
-            last_ll = this_ll + 0
-            this_ll, mat_A, mat_B, mat_C, mat_int1, mat_int2= self.log_likelihood()
-            
-            if this_ll > last_ll:
+        while np.abs((this_ll - last_ll)/last_ll) > eps:
+            try:
+                counter += 1
+                last_sol = (self.Fa, self.x0_smoothed, self.M0_smoothed, self.Qa, self.Ra)
+                
+                # compute new likelihood
+                smoother = KSQS(self.ys, 
+                                  self.Fa, 
+                                  self.x0_smoothed, self.M0_smoothed, 
+                                  self.Qa, 
+                                  self.Ra, 
+                                  Augmented = True)
+                self.Fa, self.xa_seq, self.Ma_seq, self.Ma_prio_seq = smoother.smooth() # NOTE: self.xa_seq, self.Ma_seq contains elements at time 0, while the last two does not
+                self.x0_smoothed = self.xa_seq[0].copy()
+                self.M0_smoothed = self.Ma_seq[0].copy()
+                self.xa_ns_prio_seq = smoother.xa_prio_seq[1:]
+                self.Ma_ns_prio_seq = smoother.Ma_prio_seq[1:]
+                
+                # intermediate terms for state x and observation y
+                self.mat_A = csc_matrix((2*self.p, 2*self.p))
+                self.mat_B = csc_matrix((2*self.p, 2*self.p))
+                self.mat_C = csc_matrix((2*self.p, 2*self.p))
+                for t in range(1, self.T+1): # real time step, not python index
+                    xtm1_smoothed = self.xa_seq[t-1]
+                    xt_smoothed = self.xa_seq[t]
+                    self.mat_A += self.Ma_seq[t-1] + xtm1_smoothed.dot(xtm1_smoothed.getH().tocsc()) # Equation (9)
+                    self.mat_B += self.Ma_prio_seq[t-1] + xt_smoothed.dot(xtm1_smoothed.getH().tocsc()) # Equation (10)
+                    self.mat_C += self.Ma_seq[t] + xt_smoothed.dot(xt_smoothed.getH().tocsc()) # Equation (11)
+                
+                # update F, Q, and R
+                BAinv = spsolve(self.mat_A.getH().tocsc(), self.mat_B.getH().tocsc()).getH().tocsc()
+                self.Fa = BAinv.copy() # update F
+                self.Qa = 1/self.T * (self.mat_C - BAinv.dot(self.mat_B.getH().tocsc())) # update Q
+                self.Ra = csc_matrix((2*self.q, 2*self.q))
+                for t in range(1, self.T+1): # real time step, not python index
+                    ymHx = self.yas[t-1] - sparse_col_vec_dot(self.Ha, self.xa_seq[t])
+                    self.Ra += 1/self.T * ymHx.dot(ymHx.getH().tocsc()) +\
+                                self.Ha.dot(self.Ma_seq[t]).dot(self.Ha.getH().tocsc())
+                
+                last_ll = this_ll + 0
+                this_ll = self.log_likelihood()
+                print("Iteration {:4d}, log-likelihood {:.3e} => {:.3e}, Change {:.3e}, Scale Change {:.3e}".format(counter, 
+                                                                                                           last_ll, 
+                                                                                                           this_ll, 
+                                                                                                           this_ll - last_ll, 
+                                                                                                           np.abs((this_ll - last_ll)/this_ll)))
+            except RuntimeError:
+                print("Stop due to singularity")
                 break
-            
-            # update parameters
-            BAinv = spsolve(mat_A.transpose(), mat_B.transpose()).transpose()
-            self.x0 = self.xa_seq[0].copy() # update E[x0]
-            # self.x0 = smoother.xa_initial
-            # self.M0 = mat_int1.copy() # suppose to be positive definite
-            self.M0 = self.Ma_seq[0].copy()
-            # self.Fa = BAinv.copy()
-            # self.Qa = 1/self.T * (mat_C - BAinv.dot(mat_B.getH().tocsc()))
-            ##x
-            Fhem = self.Fa.getH().tocsc()
-            BFhem = mat_B.dot(Fhem)
-            FAFhem = self.Fa.dot(mat_A).dot(Fhem)
-            self.Qa = 1/self.T * (mat_C - BFhem - BFhem.getH().tocsc() + FAFhem)
-            ##
-            self.Ra = 1/self.T * (mat_int2)
-            
-            last_sol = (self.x0.copy(), self.M0.copy(), self.Qa.copy(), self.Ra.copy(), self.Fa.copy())
-            
-            
-            print("Iteration {:5d}, New log-likelihood {:.5e}, Last log-likelihood {:.5e}, Change {:.5e}".format(counter, this_ll, last_ll, this_ll - last_ll))
         
         return last_sol
         
@@ -563,7 +569,7 @@ if __name__ == "__main__":
     # learn_obj = EMLearn(ys, F, xhatplus, Mplus, Q, R)
     # F, Q, R, x0, M0 = learn_obj.learn(np.array([0.99, 0.01]), 1e-5)
     smoother = KSQS(ys, F, x0, Mplus, Q, R)
-    x_seq, M_seq, M_prio_seq = smoother.smooth()
+    F_sm, x_seq, M_seq, M_prio_seq = smoother.smooth()
     print(len(x_seq), len(M_seq), len(M_prio_seq))
     for i in range(len(x_seq)):
         print(i)
@@ -581,9 +587,9 @@ if __name__ == "__main__":
     print("="*100)
     
     # EM algorithm
-    esp = 1e-6
+    esp = 1e-4
     param_estor = EMLearn(ys, F, x0, Mplus, Q, R)
-    estX0, estM0, estQ, estR, estF = param_estor.learn(esp)
+    estF, estX0, estM0, estQ, estR = param_estor.learn(esp)
     print("-"*100)
     # print(estX0.toarray())
     # print()
@@ -603,9 +609,8 @@ if __name__ == "__main__":
     realQ = estQ.toarray()[range(num_dim),:][:,range(num_dim)]
     realR = estR.toarray()[range(num_meas_dim),:][:,range(num_meas_dim)]
     realP = estQ.toarray()[range(num_dim),:][:,range(num_dim, 2*num_dim)]
-    realU = estR.toarray()[range(num_meas_dim),:][:,range(num_meas_dim, 2*num_meas_dim)]
-    smoother = KSQS(ys, realF, realX0, realM0, realQ, realR, realP, realU)
-    x_seq, M_seq, M_prio_seq = smoother.smooth()
+    smoother = KSQS(ys, realF, realX0, realM0, realQ, realR, realP)
+    F_est, x_seq, M_seq, M_prio_seq = smoother.smooth()
     print(len(x_seq), len(M_seq), len(M_prio_seq))
     for i in range(len(x_seq)):
         print(i)
@@ -619,6 +624,7 @@ if __name__ == "__main__":
         # if i >= 1:
         #     print("M prior")
         #     print(M_prio_seq[i-1].toarray())
+    
 
 
 
