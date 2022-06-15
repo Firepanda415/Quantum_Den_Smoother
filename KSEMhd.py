@@ -1,14 +1,14 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Aug 11 02:04:03 2021
-
-@author: Muqing Zheng
-"""
 import numpy as np
 import sympy as sym
+import scipy.sparse as ss
 from scipy.sparse import csc_matrix, csr_matrix, vstack, hstack, diags, identity, block_diag, kron
 from scipy.sparse.linalg import spsolve, splu, norm
 from scipy.linalg import det, eig
+
+H_GATE = 1/np.sqrt(2)*np.matrix([[1,1],[1,-1]])
+H_GATE_v = np.kron(H_GATE, H_GATE)
+YB_GATE = 1/np.sqrt(2)*np.matrix([[1,1],[1j,-1j]])  # y-basis measurement gate \0><R| + |1><L|, |R> = 1/sqrt(2) * (|0>+i|1>), |L> = 1/sqrt(2) * (|0>-i|1>)
+YB_GATE_v = np.kron(YB_GATE, YB_GATE)
 
 def dictToVec(counts):
     """ Transfer counts to probabilities
@@ -229,10 +229,17 @@ class KSQS: # quantum system kalman smoother, state is vectorized density matrix
         self.Ma_prio_smooth_seq = [] # for EM algorithm
         self.Ma_smooth_seq = []
         
-        self.H = self.meas_mat(self.num_qubits)
-        nrows = 2**self.num_qubits
-        ncols = nrows**2
-        mat = csc_matrix((nrows, ncols), dtype=complex)
+        z_basis_meas_mat = self.meas_mat(self.num_qubits)
+        H_GATE_3q = np.kron(np.kron(H_GATE, H_GATE), H_GATE) #WARNING: Only for 3-qubit example
+        x_basis_meas_mat = z_basis_meas_mat.dot(np.kron(H_GATE_3q, H_GATE_3q))
+        # YB_GATE_3q = np.kron(np.kron(YB_GATE, YB_GATE), YB_GATE)
+        # y_basis_meas_mat = z_basis_meas_mat.dot(np.kron(YB_GATE_3q, YB_GATE_3q))
+        self.H = vstack([z_basis_meas_mat, x_basis_meas_mat], format='csc')
+        # self.H = vstack([z_basis_meas_mat, x_basis_meas_mat, y_basis_meas_mat], format='csc')
+        # self.H = self.meas_mat(self.num_qubits)
+        # nrows = 2**self.num_qubits
+        # ncols = nrows**2
+        # mat = csc_matrix((nrows, ncols), dtype=complex)
         self.Ha = 0.5*hstack([self.H, self.H], format='csc')
         
     def meas_mat(self, num_qubits):# H, measurement matrix for vectorized density matrix
@@ -315,6 +322,7 @@ class KSQS: # quantum system kalman smoother, state is vectorized density matrix
         
         iden_mat = identity(2*self.p, dtype=complex, format='csc') 
         last_Mk_prio_smooth = (iden_mat - last_gain_meas.dot(self.Ha)).dot(self.Fa).dot(self.Ma_seq[T-1])
+        # last_Mk_prio_smooth[last_Mk_prio_smooth < 0] = 0 # WARNING
         self.Ma_prio_smooth_seq.append(last_Mk_prio_smooth)
         
         # Backward iteration
@@ -322,7 +330,8 @@ class KSQS: # quantum system kalman smoother, state is vectorized density matrix
             xk_prior = self.xa_prio_seq[t_inv]
             Mk_prior = self.Ma_prio_seq[t_inv]
             Mkm1FHem_transpose = self.Fa.conjugate().dot(self.Ma_seq[t_inv-1].transpose())
-            Gkm1 = spsolve(Mk_prior.transpose(), Mkm1FHem_transpose) # new Gain from x (instead of from y, like the one in the filter)
+            # Gkm1 = spsolve(Mk_prior.transpose(), Mkm1FHem_transpose) # new Gain from x (instead of from y, like the one in the filter)
+            Gkm1 =  self.Ma_seq[t_inv-1].dot(self.Fa.conjugate().dot(ss.linalg.inv(self.Ma_prio_seq[t_inv])))
             
             xk_smooth = self.xa_seq[t_inv-1] + sparse_col_vec_dot(Gkm1, (self.xa_smooth_seq[0] - xk_prior))
             Mk_smooth = self.Ma_seq[t_inv-1] + Gkm1.dot(self.Ma_smooth_seq[0] - Mk_prior).dot(Gkm1.getH().tocsc())
@@ -525,7 +534,7 @@ class EMLearn:
             # if np.abs((this_ll - last_ll)/last_ll) >  10:
             #     print("Ends", 'New ll {:.2f}, Last ll {:.2f}'.format(this_ll, last_ll))
             #     break
-            if this_ll < last_ll:
+            if this_ll < last_ll or this_ll > 1e10:
                 break
             
             
@@ -551,85 +560,208 @@ class EMLearn:
             print("Iteration {:5d}, New log-likelihood {:.5e}, Last log-likelihood {:.5e}, Change {:.5e}".format(counter, this_ll, last_ll, this_ll - last_ll))
         
         return last_sol
+    
+    
+####################################################################################
+def single_iter(n_qubits=2):
+    # iterate = QuantumCircuit(n_qubits)
+    # iterate.h(0)
+    # iterate.cx(0,1)
+    # iterate.cx(1,2)
+    # iterate.ccx(0,1,2)
+    # iterate.barrier()
+    iterate = QuantumCircuit(n_qubits)
+    iterate.h(0)
+    iterate.cx(0,1)
+    iterate.cx(1,2)
+    iterate.barrier()
+    iterate.cx(1,2)
+    iterate.cx(0,1)
+    iterate.h(0)
+    iterate.barrier()
+    return iterate
+
+
+
+def iterative_circ(num_itrs, n_qubits=2, save_den = True, meas_basis='z'):   
+    total_circ = QuantumCircuit(n_qubits)
+    for i in range(num_itrs):
+        total_circ.compose(single_iter(n_qubits), inplace=True)
+    if meas_basis == 'x':
+        for i in range(n_qubits):
+            total_circ.h(i)
+    if meas_basis == 'y':
+        for i in range(n_qubits):
+            total_circ.sdg(i)
+            total_circ.h(i)
+    if save_den:
+        total_circ.save_density_matrix(pershot=False)
+        return total_circ
         
+    total_circ.measure_all()
+    return total_circ
+
+from scipy.linalg import sqrtm
+def state_fid(m1,m2):
+    sqm1 = sqrtm(m1)
+    temp = sqm1.dot(m2).dot(sqm1)
+    temp2 = sqrtm(temp)
+    return np.real(np.trace(temp2))**2
+####################################################################################        
     
 if __name__ == "__main__":  
-    num_dim = 4
-    num_meas_dim = 2
-    x = np.zeros(num_dim)
-    x[0] = np.sqrt(0.5)
-    x[3] = np.sqrt(0.5)
+
+
+    from collections import Counter
+    from qiskit import IBMQ,Aer,schedule, execute, QuantumCircuit, QuantumRegister, ClassicalRegister, transpile
+    from qiskit.tools.visualization import plot_histogram
+    from qiskit.visualization import timeline_drawer
+    from qiskit.visualization.pulse_v2 import draw, IQXDebugging
+    from qiskit.tools.monitor import job_monitor
+    from qiskit.providers.aer.noise import NoiseModel
+    from qiskit.providers.aer import AerSimulator
+    import qiskit.quantum_info as qi
+    from qiskit.providers.aer.noise import QuantumError, ReadoutError
     
-    # inputs
-    x0 = x.copy() # E[xhat_0^+]
-    Mplus = np.identity(num_dim)*1 # covariance matrix, E[(x0-xhat0^+)(x0-xhat0^+)^T]
-    Q = np.identity(num_dim)*1 # Process uncertainty/noise
-    R = np.identity(num_meas_dim)*1 # measurement uncertainty/noise
+    # Tomography functions
+    from qiskit_experiments.framework import ParallelExperiment
+    from qiskit_experiments.library import StateTomography
     
-    Gate = np.array([[1,1],[1,-1]])*(1/np.sqrt(2))
+    # Seeds
+    from numpy.random import Generator, PCG64
+    rng = Generator(PCG64(1897))
+    MY_SEEDS = rng.integers(0,high=10**8,size=100)
     
-    F = np.kron(Gate.conjugate(), Gate)
-    #F = np.identity(2)
-    ys = [np.array([0.5, 0.5]), np.array([0.9, 0.1]), np.array([0.5, 0.5]), np.array([0.8, 0.2])]
-    # learn_obj = EMLearn(ys, F, xhatplus, Mplus, Q, R)
-    # F, Q, R, x0, M0 = learn_obj.learn(np.array([0.99, 0.01]), 1e-5)
-    smoother = KSQS(ys, F, x0, Mplus, Q, R)
-    x_seq, M_seq, M_prio_seq = smoother.smooth()
-    print(len(x_seq), len(M_seq), len(M_prio_seq))
-    for i in range(len(x_seq)):
-        print(i)
-        # print(x_seq[i].toarray())
-        # print()
-        print()
-        real_state = x_seq[i].toarray()[:num_dim]
-        real_state = real_state/np.sqrt(np.sum(np.abs(real_state)**2))
-        print(np.abs(real_state)**2)
-        # print("M")
-        # print(M_seq[i].toarray())
-        # if i >= 1:
-        #     print("M prior")
-        #     print(M_prio_seq[i-1].toarray())
-    print("="*100)
+    import matplotlib.pyplot as plt
+    from matplotlib.pyplot import figure
     
-    # EM algorithm
-    esp = 1e-6
-    param_estor = EMLearn(ys, F, x0, Mplus, Q, R)
-    estX0, estM0, estQ, estR, estF = param_estor.learn(esp)
-    print("-"*100)
-    # print(estX0.toarray())
-    # print()
-    # print(estM0.toarray())
-    # print()
-    # print(estQ.toarray())
-    # print()
-    # print(estR.toarray())
+    # plt.rcParams['text.usetex'] = True
+    fig_size = (8,6)
+    fig_dpi = 150    
+    # IBMQ.load_account()
+
+
+    # provider = IBMQ.get_provider(hub="ibm-q-pnnl", group="internal", project="default")
+    # name = "ibmq_brooklyn"
+    # backend = provider.get_backend(name)
+    # backend_noise_model = NoiseModel.from_backend(backend)
+    den_simu = AerSimulator(method='density_matrix')
     
-    print("="*100)
-    realX0 = estX0.toarray()[:num_dim]
-    print("New x0\n", realX0)
-    realM0 = estM0.toarray()[range(num_dim),:][:,range(num_dim)]
-    realF = estF.toarray()[range(num_dim),:][:,range(num_dim)]
-    print("New F\n", realF)
-    print("FF^*\n", realF.dot(np.matrix(realF).H))
-    realQ = estQ.toarray()[range(num_dim),:][:,range(num_dim)]
-    realR = estR.toarray()[range(num_meas_dim),:][:,range(num_meas_dim)]
-    realP = estQ.toarray()[range(num_dim),:][:,range(num_dim, 2*num_dim)]
-    realU = estR.toarray()[range(num_meas_dim),:][:,range(num_meas_dim, 2*num_meas_dim)]
-    smoother = KSQS(ys, realF, realX0, realM0, realQ, realR, realP, realU)
-    x_seq, M_seq, M_prio_seq = smoother.smooth()
-    print(len(x_seq), len(M_seq), len(M_prio_seq))
-    for i in range(len(x_seq)):
-        print(i)
-        # print(x_seq[i].toarray())
-        print()
-        real_state = x_seq[i].toarray()[:num_dim]
-        real_state = real_state/np.sqrt(np.sum(np.abs(real_state)**2))
-        print(np.abs(real_state)**2)
-        # print("M")
-        # print(M_seq[i].toarray())
-        # if i >= 1:
-        #     print("M prior")
-        #     print(M_prio_seq[i-1].toarray())
+    n_qubits = 3
+    reps = 8
+    max_num_itrs = 10
+
+    unitary_simulator = Aer.get_backend('aer_simulator')
+    unitary_circ = transpile(single_iter(n_qubits), backend=den_simu)
+    unitary_circ.save_unitary()
+    unitary_result = unitary_simulator.run(unitary_circ).result()
+    unitary = unitary_result.get_unitary(unitary_circ)
+    
+    unitaries = []
+    for i in range(1, max_num_itrs+1):
+        gate = unitary.data
+        F = np.kron(gate.conjugate(), gate)
+        unitaries.append(F)
+        
+    total_simu_dens = [] # quantum state in density-matrix form
+    total_simu_probs = [] # measurement result
+    total_simu_purs = [] # purity
+    for i in range(1, max_num_itrs+1):
+        my_seed = MY_SEEDS[i]
+        trans_circ = transpile(iterative_circ(i, n_qubits, save_den = True), seed_transpiler=my_seed, backend=den_simu,optimization_level=0)
+        iter_res = den_simu.run(trans_circ,shots=8192*reps,seed_simulator=my_seed).result()
+        iter_den = iter_res.data()['density_matrix']
+        total_simu_dens.append(iter_den)
+        
+        trans_circ = transpile(iterative_circ(i, n_qubits, save_den = False), seed_transpiler=my_seed, backend=den_simu,optimization_level=0)
+        iter_res = den_simu.run(trans_circ,shots=8192*reps,seed_simulator=my_seed).result()
+        total_simu_probs.append(dictToVec(iter_res.get_counts()))
+        total_simu_purs.append(np.real(iter_den.purity()))
+        
+    total_simu_probs_x = [] # measurement result, x-basis
+    for i in range(1, max_num_itrs+1):
+        my_seed = MY_SEEDS[i]
+        trans_circ = transpile(iterative_circ(i, n_qubits, save_den = False, meas_basis = 'x'), seed_transpiler=my_seed, backend=den_simu,optimization_level=0)
+        iter_res = den_simu.run(trans_circ,shots=8192*reps,seed_simulator=my_seed).result()
+        total_simu_probs_x.append(dictToVec(iter_res.get_counts()))
+        
+    observs = []
+    for i in range(len(total_simu_probs)):
+        z_meas_p = total_simu_probs[i]
+        x_meas_p = total_simu_probs_x[i]
+    #     y_meas_p = total_simu_probs_y[i]
+    #     observs.append(np.append(np.append(z_meas_p, x_meas_p),y_meas_p))
+        observs.append(np.append(z_meas_p, x_meas_p))
+
+    initial_state = np.array([0]*((2**3)**2), dtype=complex)
+    initial_state[0] = 1
+    
+    # initial state
+    num_dim = initial_state.size
+    x =initial_state
+    x[0]-= 0.01/num_dim
+    nrows = int(x.size-1)
+    for k in range(1,nrows+1):
+        x[k] += 1/(num_dim*nrows)
+        
+    # Other variance parameters
+    num_dim_state = initial_state.size
+    num_dim_obs = observs[0].size
+    
+    M = np.identity(num_dim_state, dtype=complex)* 0.02 * (1) # a guess for covariance matrix, E[(x0-xhat0^+)(x0-xhat0^+)^T]
+    Q = np.identity(num_dim_state, dtype=complex)* 0.2 * (1) # state covariance
+    R = np.identity(num_dim_obs, dtype=complex)* 0.1 * (1) # meas covariance
+    P = np.identity(num_dim_state, dtype=complex)* 0.05 * (1)# 
+    
+    
+    total_smoother_dens = []
+    total_smoother_purs = []
+    
+    # observs = total_simu_probs
+    learn_obj = EMLearn(observs, unitaries[0], x, M, Q, R, P)
+    estX0, estM0, estQ, estR, estF = learn_obj.learn() # they are all arguemented
+    
+    # Slice from argumented system
+    realX0 = estX0.toarray()[:num_dim_state]
+    
+    realM0 = estM0.toarray()[range(num_dim_state),:][:,range(num_dim_state)]
+    realF = estF.toarray()[range(num_dim_state),:][:,range(num_dim_state)]
+    realQ = estQ.toarray()[range(num_dim_state),:][:,range(num_dim_state)]
+    realR = estR.toarray()[range(num_dim_obs),:][:,range(num_dim_obs)]
+    realP = estQ.toarray()[range(num_dim_state),:][:,range(num_dim_state, 2*num_dim_state)]
+    
+    smoother = KSQS(observs, realF, realX0, realM0, realQ, realR, realP)
+    x_seq, M_seq, M_prio_seq = smoother.smooth() 
+    
+    for j in range(max_num_itrs):   
+        x_est = np.matrix(x_seq[j+1][:num_dim_state].todense()).flatten().reshape((int(np.sqrt(num_dim_state)), int(np.sqrt(num_dim_state))), order='F')
+        final_den = closed_den_mat(x_est)
+        total_smoother_dens.append(final_den)
+        total_smoother_purs.append(np.real(qi.DensityMatrix(final_den).purity()))
+    
+    print(np.sum(realQ.real<0))
+    
+    for den in total_smoother_dens:
+        print("Is state a valid density matrix:", qi.DensityMatrix(den).is_valid())
+        
+    # Compare fidelity, use Qiskit API (when every state from KS is a valid density matrix)
+    diff_fed_all= []
+    for i in range(max_num_itrs):
+        qis_den_all = qi.DensityMatrix(total_smoother_dens[i])
+        fed_difference_all =  qi.state_fidelity(total_simu_dens[i], qis_den_all)
+        diff_fed_all.append(fed_difference_all)
+        print("Iteration",i+1, "KS Fid:", fed_difference_all)
+        
+    iter_range = range(max_num_itrs)
+    plt.plot(np.array(iter_range)+1, np.array(diff_fed_all)[iter_range], '+-', color='red', label='KS')
+    plt.xlabel("Number of Iterations")
+    plt.ylabel("Fidelity")
+    plt.xticks((np.array(iter_range)+1))
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
 
 
 
